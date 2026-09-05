@@ -9,7 +9,6 @@
 #pragma once
 
 #include <algorithm> // all_of
-#include <cctype> // isdigit
 #include <cerrno> // errno, ERANGE
 #include <cstdlib> // strtoull
 #ifndef JSON_NO_IO
@@ -358,12 +357,13 @@ class json_pointer
             // convert null values to arrays or objects before continuing
             if (ptr->is_null())
             {
-                // check if reference token is a number
+                // check if reference token is a number; `std::isdigit` would go through the
+                // locale for an answer that JSON fixes to the ASCII digits anyway
                 const bool nums =
                     std::all_of(reference_token.begin(), reference_token.end(),
                                 [](const unsigned char x)
                 {
-                    return std::isdigit(x);
+                    return x >= '0' && x <= '9';
                 });
 
                 // change value to array for numbers or "-" or to object otherwise
