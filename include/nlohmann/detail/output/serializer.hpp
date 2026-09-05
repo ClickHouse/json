@@ -9,9 +9,8 @@
 
 #pragma once
 
-#include <algorithm> // reverse, remove, fill, find, none_of
+#include <algorithm> // copy, fill, find_if, find_if_not, none_of, reverse
 #include <array> // array
-#include <clocale> // localeconv, lconv
 #include <cmath> // labs, isfinite, isnan, signbit
 #include <cstddef> // size_t, ptrdiff_t
 #include <cstdint> // uint8_t
@@ -67,9 +66,6 @@ class serializer
     serializer(output_adapter_t<char> s, const char ichar,
                error_handler_t error_handler_ = error_handler_t::strict)
         : o(std::move(s))
-        , loc(std::localeconv())
-        , thousands_sep(loc->thousands_sep == nullptr ? '\0' : std::char_traits<char>::to_char_type(* (loc->thousands_sep)))
-        , decimal_point(loc->decimal_point == nullptr ? '\0' : std::char_traits<char>::to_char_type(* (loc->decimal_point)))
         , indent_char(ichar)
         , indent_string(512, indent_char)
         , error_handler(error_handler_)
@@ -830,34 +826,40 @@ class serializer
         // get number of digits for a float -> text -> float round-trip
         static constexpr auto d = std::numeric_limits<number_float_t>::max_digits10;
 
-        // the actual conversion
+        // the actual conversion; this overload is selected for the floating-point types
+        // that are neither IEEE-754 single nor double precision, so `x` is passed with the
+        // length modifier of the widest one - `%g` would read only a `double` off the
+        // variadic argument list and return a number unrelated to `x`
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-        std::ptrdiff_t len = (std::snprintf)(number_buffer.data(), number_buffer.size(), "%.*g", d, x);
+        std::ptrdiff_t len = (std::snprintf)(number_buffer.data(), number_buffer.size(), "%.*Lg", d,
+                                            static_cast<long double>(x));
 
         // negative value indicates an error
         JSON_ASSERT(len > 0);
         // check if buffer was large enough
         JSON_ASSERT(static_cast<std::size_t>(len) < number_buffer.size());
 
-        // erase thousands separator
-        if (thousands_sep != '\0')
+        // `%g` writes the radix character of the current `LC_NUMERIC` locale, while JSON
+        // always writes `.`. Locate it without asking the locale - `localeconv` returns a
+        // pointer into shared mutable state, so it races with a `setlocale` in another
+        // thread: everything else `printf` puts into a finite number is a digit, a sign or
+        // the exponent marker, because digits are grouped only when asked with the POSIX
+        // `'` flag. The radix character is several bytes long in a few locales, hence the
+        // whole run is replaced with a single `.`.
+        const auto is_number_character = [](char c) noexcept
         {
-            // NOLINTNEXTLINE(readability-qualified-auto,llvm-qualified-auto): std::remove returns an iterator, see https://github.com/nlohmann/json/issues/3081
-            const auto end = std::remove(number_buffer.begin(), number_buffer.begin() + len, thousands_sep);
-            std::fill(end, number_buffer.end(), '\0');
-            JSON_ASSERT((end - number_buffer.begin()) <= len);
-            len = (end - number_buffer.begin());
-        }
+            return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e' || c == 'E';
+        };
 
-        // convert decimal point to '.'
-        if (decimal_point != '\0' && decimal_point != '.')
+        const auto number_end = number_buffer.begin() + len;
+        const auto radix_begin = std::find_if_not(number_buffer.begin(), number_end, is_number_character);
+        if (radix_begin != number_end)
         {
-            // NOLINTNEXTLINE(readability-qualified-auto,llvm-qualified-auto): std::find returns an iterator, see https://github.com/nlohmann/json/issues/3081
-            const auto dec_pos = std::find(number_buffer.begin(), number_buffer.end(), decimal_point);
-            if (dec_pos != number_buffer.end())
-            {
-                *dec_pos = '.';
-            }
+            const auto radix_end = std::find_if(radix_begin + 1, number_end, is_number_character);
+            *radix_begin = '.';
+            const auto end = std::copy(radix_end, number_end, radix_begin + 1);
+            std::fill(end, number_buffer.end(), '\0');
+            len = (end - number_buffer.begin());
         }
 
         o->write_characters(number_buffer.data(), static_cast<std::size_t>(len));
@@ -964,13 +966,6 @@ class serializer
 
     /// a (hopefully) large enough character buffer
     std::array<char, 64> number_buffer{{}};
-
-    /// the locale
-    const std::lconv* loc = nullptr;
-    /// the locale's thousand separator character
-    const char thousands_sep = '\0';
-    /// the locale's decimal point character
-    const char decimal_point = '\0';
 
     /// string buffer
     std::array<char, 512> string_buffer{{}};

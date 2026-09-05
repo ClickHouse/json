@@ -7027,7 +7027,6 @@ NLOHMANN_JSON_NAMESPACE_END
 
 
 #include <array> // array
-#include <clocale> // localeconv
 #include <cstddef> // size_t
 #include <cstdio> // snprintf
 #include <cstdlib> // strtof, strtod, strtold, strtoll, strtoull
@@ -7146,7 +7145,6 @@ class lexer : public lexer_base<BasicJsonType>
     explicit lexer(InputAdapterType&& adapter, bool ignore_comments_ = false) noexcept
         : ia(std::move(adapter))
         , ignore_comments(ignore_comments_)
-        , decimal_point_char(static_cast<char_int_type>(get_decimal_point()))
     {}
 
     // delete because of pointer members
@@ -7157,19 +7155,6 @@ class lexer : public lexer_base<BasicJsonType>
     ~lexer() = default;
 
   private:
-    /////////////////////
-    // locales
-    /////////////////////
-
-    /// return the locale-dependent decimal point
-    JSON_HEDLEY_PURE
-    static char get_decimal_point() noexcept
-    {
-        const auto* loc = localeconv();
-        JSON_ASSERT(loc != nullptr);
-        return (loc->decimal_point == nullptr) ? '.' : *(loc->decimal_point);
-    }
-
     /////////////////////
     // scan functions
     /////////////////////
@@ -7950,6 +7935,115 @@ class lexer : public lexer_base<BasicJsonType>
     }
 
     /*!
+    @brief the exponent of the scanned number, saturated
+
+    @param[in] exponent_position  position of `e` or `E` in token_buffer, or its size
+                                  when the number has no exponent
+
+    The magnitude is saturated at a value that already makes every floating-point
+    type read the number as infinity or zero, whatever its digits are, so that an
+    absurd exponent in the input cannot overflow the arithmetic in
+    `radix_free_number`.
+    */
+    long long scanned_exponent(std::size_t exponent_position) const noexcept
+    {
+        if (exponent_position == token_buffer.size())
+        {
+            return 0;
+        }
+
+        // the digits of the number are worth at most one decimal exponent each
+        const long long saturation = 1000000 + static_cast<long long>(token_buffer.size());
+
+        std::size_t i = exponent_position + 1;
+        const bool is_negative = token_buffer[i] == '-';
+        if (is_negative || token_buffer[i] == '+')
+        {
+            ++i;
+        }
+
+        long long exponent = 0;
+        for (; i < token_buffer.size() && exponent <= saturation; ++i)
+        {
+            exponent = (exponent * 10) + static_cast<long long>(token_buffer[i] - '0');
+        }
+        if (exponent > saturation)
+        {
+            exponent = saturation;
+        }
+
+        return is_negative ? -exponent : exponent;
+    }
+
+    /*!
+    @brief the scanned number rewritten without a radix character
+
+    JSON always writes the radix character as `.` (Sect. 6 of RFC 8259), while
+    `std::strtod` and friends expect the radix character of the current
+    `LC_NUMERIC` locale. Asking the locale which character that is would be worse
+    than the disease: `localeconv` returns a pointer into shared mutable state, so
+    it races with a `setlocale` in another thread, and the answer can be several
+    bytes long. Instead the radix character is dropped and the shift it implies is
+    folded into the exponent, which leaves a literal that every locale reads the
+    same way: `-1.25e3` becomes `-125e1`.
+
+    @return token_buffer itself when the number has no radix character, and the
+            rewrite in number_buffer otherwise
+    */
+    const string_t& radix_free_number()
+    {
+        if (decimal_point_position == std::string::npos)
+        {
+            return token_buffer;
+        }
+
+        std::size_t exponent_position = decimal_point_position + 1;
+        while (exponent_position < token_buffer.size()
+                && token_buffer[exponent_position] != 'e' && token_buffer[exponent_position] != 'E')
+        {
+            ++exponent_position;
+        }
+
+        // scan_number accepted the token, so at least one digit follows the radix character
+        const auto fraction_digits = static_cast<long long>(exponent_position - decimal_point_position - 1);
+        const long long exponent = scanned_exponent(exponent_position) - fraction_digits;
+
+        number_buffer.clear();
+        for (std::size_t i = 0; i < exponent_position; ++i)
+        {
+            if (i != decimal_point_position)
+            {
+                number_buffer.push_back(token_buffer[i]);
+            }
+        }
+
+        number_buffer.push_back('e');
+        if (exponent < 0)
+        {
+            number_buffer.push_back('-');
+        }
+
+        // the digits of the exponent, least significant first
+        std::array<char, 24> exponent_digits{};
+        std::size_t digit_count = 0;
+        auto magnitude = static_cast<unsigned long long>(exponent < 0 ? -exponent : exponent);
+        do
+        {
+            exponent_digits[digit_count++] = static_cast<char>('0' + (magnitude % 10));
+            magnitude /= 10;
+        }
+        while (magnitude != 0);
+
+        while (digit_count != 0)
+        {
+            number_buffer.push_back(exponent_digits[--digit_count]);
+        }
+
+        return number_buffer;
+    }
+
+
+    /*!
     @brief scan a number literal
 
     This function scans a string according to Sect. 6 of RFC 8259.
@@ -8070,7 +8164,7 @@ scan_number_zero:
         {
             case '.':
             {
-                add(decimal_point_char);
+                add(current);
                 decimal_point_position = token_buffer.size() - 1;
                 goto scan_number_decimal1;
             }
@@ -8107,7 +8201,7 @@ scan_number_any1:
 
             case '.':
             {
-                add(decimal_point_char);
+                add(current);
                 decimal_point_position = token_buffer.size() - 1;
                 goto scan_number_decimal1;
             }
@@ -8308,10 +8402,11 @@ scan_number_done:
 
         // this code is reached if we parse a floating-point number or if an
         // integer conversion above failed
-        strtof(value_float, token_buffer.data(), &endptr);
+        const string_t& number = radix_free_number();
+        strtof(value_float, number.data(), &endptr);
 
         // we checked the number format before
-        JSON_ASSERT(endptr == token_buffer.data() + token_buffer.size());
+        JSON_ASSERT(endptr == number.data() + number.size());
 
         return token_type::value_float;
     }
@@ -8455,11 +8550,6 @@ scan_number_done:
     /// return current string value (implicitly resets the token; useful only once)
     string_t& get_string()
     {
-        // translate decimal points from locale back to '.' (#4084)
-        if (decimal_point_char != '.' && decimal_point_position != std::string::npos)
-        {
-            token_buffer[decimal_point_position] = '.';
-        }
         return token_buffer;
     }
 
@@ -8655,10 +8745,10 @@ scan_number_done:
     number_unsigned_t value_unsigned = 0;
     number_float_t value_float = 0;
 
-    /// the decimal point
-    const char_int_type decimal_point_char = '.';
-    /// the position of the decimal point in the input
+    /// the position of the radix character in token_buffer
     std::size_t decimal_point_position = std::string::npos;
+    /// buffer for the radix-character-free rewrite of a number token
+    string_t number_buffer {};
 };
 
 }  // namespace detail
@@ -14508,7 +14598,6 @@ NLOHMANN_JSON_NAMESPACE_END
 
 
 #include <algorithm> // all_of
-#include <cctype> // isdigit
 #include <cerrno> // errno, ERANGE
 #include <cstdlib> // strtoull
 #ifndef JSON_NO_IO
@@ -14862,12 +14951,13 @@ class json_pointer
             // convert null values to arrays or objects before continuing
             if (ptr->is_null())
             {
-                // check if reference token is a number
+                // check if reference token is a number; `std::isdigit` would go through the
+                // locale for an answer that JSON fixes to the ASCII digits anyway
                 const bool nums =
                     std::all_of(reference_token.begin(), reference_token.end(),
                                 [](const unsigned char x)
                 {
-                    return std::isdigit(x);
+                    return x >= '0' && x <= '9';
                 });
 
                 // change value to array for numbers or "-" or to object otherwise
@@ -17603,9 +17693,8 @@ NLOHMANN_JSON_NAMESPACE_END
 
 
 
-#include <algorithm> // reverse, remove, fill, find, none_of
+#include <algorithm> // copy, fill, find_if, find_if_not, none_of, reverse
 #include <array> // array
-#include <clocale> // localeconv, lconv
 #include <cmath> // labs, isfinite, isnan, signbit
 #include <cstddef> // size_t, ptrdiff_t
 #include <cstdint> // uint8_t
@@ -18788,9 +18877,6 @@ class serializer
     serializer(output_adapter_t<char> s, const char ichar,
                error_handler_t error_handler_ = error_handler_t::strict)
         : o(std::move(s))
-        , loc(std::localeconv())
-        , thousands_sep(loc->thousands_sep == nullptr ? '\0' : std::char_traits<char>::to_char_type(* (loc->thousands_sep)))
-        , decimal_point(loc->decimal_point == nullptr ? '\0' : std::char_traits<char>::to_char_type(* (loc->decimal_point)))
         , indent_char(ichar)
         , indent_string(512, indent_char)
         , error_handler(error_handler_)
@@ -19551,35 +19637,42 @@ class serializer
         // get number of digits for a float -> text -> float round-trip
         static constexpr auto d = std::numeric_limits<number_float_t>::max_digits10;
 
-        // the actual conversion
+        // the actual conversion; this overload is selected for the floating-point types
+        // that are neither IEEE-754 single nor double precision, so `x` is passed with the
+        // length modifier of the widest one - `%g` would read only a `double` off the
+        // variadic argument list and return a number unrelated to `x`
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-        std::ptrdiff_t len = (std::snprintf)(number_buffer.data(), number_buffer.size(), "%.*g", d, x);
+        std::ptrdiff_t len = (std::snprintf)(number_buffer.data(), number_buffer.size(), "%.*Lg", d,
+                                            static_cast<long double>(x));
 
         // negative value indicates an error
         JSON_ASSERT(len > 0);
         // check if buffer was large enough
         JSON_ASSERT(static_cast<std::size_t>(len) < number_buffer.size());
 
-        // erase thousands separator
-        if (thousands_sep != '\0')
+        // `%g` writes the radix character of the current `LC_NUMERIC` locale, while JSON
+        // always writes `.`. Locate it without asking the locale - `localeconv` returns a
+        // pointer into shared mutable state, so it races with a `setlocale` in another
+        // thread: everything else `printf` puts into a finite number is a digit, a sign or
+        // the exponent marker, because digits are grouped only when asked with the POSIX
+        // `'` flag. The radix character is several bytes long in a few locales, hence the
+        // whole run is replaced with a single `.`.
+        const auto is_number_character = [](char c) noexcept
         {
-            // NOLINTNEXTLINE(readability-qualified-auto,llvm-qualified-auto): std::remove returns an iterator, see https://github.com/nlohmann/json/issues/3081
-            const auto end = std::remove(number_buffer.begin(), number_buffer.begin() + len, thousands_sep);
+            return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e' || c == 'E';
+        };
+
+        const auto number_end = number_buffer.begin() + len;
+        const auto radix_begin = std::find_if_not(number_buffer.begin(), number_end, is_number_character);
+        if (radix_begin != number_end)
+        {
+            const auto radix_end = std::find_if(radix_begin + 1, number_end, is_number_character);
+            *radix_begin = '.';
+            const auto end = std::copy(radix_end, number_end, radix_begin + 1);
             std::fill(end, number_buffer.end(), '\0');
-            JSON_ASSERT((end - number_buffer.begin()) <= len);
             len = (end - number_buffer.begin());
         }
 
-        // convert decimal point to '.'
-        if (decimal_point != '\0' && decimal_point != '.')
-        {
-            // NOLINTNEXTLINE(readability-qualified-auto,llvm-qualified-auto): std::find returns an iterator, see https://github.com/nlohmann/json/issues/3081
-            const auto dec_pos = std::find(number_buffer.begin(), number_buffer.end(), decimal_point);
-            if (dec_pos != number_buffer.end())
-            {
-                *dec_pos = '.';
-            }
-        }
 
         o->write_characters(number_buffer.data(), static_cast<std::size_t>(len));
 
@@ -19685,13 +19778,6 @@ class serializer
 
     /// a (hopefully) large enough character buffer
     std::array<char, 64> number_buffer{{}};
-
-    /// the locale
-    const std::lconv* loc = nullptr;
-    /// the locale's thousand separator character
-    const char thousands_sep = '\0';
-    /// the locale's decimal point character
-    const char decimal_point = '\0';
 
     /// string buffer
     std::array<char, 512> string_buffer{{}};
