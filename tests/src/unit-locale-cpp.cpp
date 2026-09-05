@@ -13,6 +13,15 @@
 using nlohmann::json;
 
 #include <clocale>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+/// A `basic_json` whose floating-point type is neither IEEE-754 single nor double precision
+/// is serialized with `snprintf` instead of the built-in Grisu2 conversion.
+using json_long_double = nlohmann::basic_json<std::map, std::vector, std::string, bool,
+      std::int64_t, std::uint64_t, long double>;
 
 struct ParserImpl final: public nlohmann::json_sax<json>
 {
@@ -158,4 +167,66 @@ TEST_CASE("locale-dependent test (LC_NUMERIC=de_DE)")
     {
         MESSAGE("locale de_DE is not usable");
     }
+}
+
+TEST_CASE("numbers do not depend on the locale")
+{
+    // `ps_AF` is the interesting one: its decimal point is U+066B, which UTF-8 spells with
+    // two bytes, so a conversion that assumes a single-byte radix character mangles it
+    for (const char* locale_name : {"C", "de_DE", "de_DE.UTF-8", "ps_AF", "ps_AF.UTF-8"})
+    {
+        if (std::setlocale(LC_NUMERIC, locale_name) == nullptr)
+        {
+            MESSAGE("locale " << std::string(locale_name) << " is not usable");
+            continue;
+        }
+
+        CAPTURE(locale_name);
+
+        SECTION("parsing")
+        {
+            CHECK(json::parse("12.34").get<double>() == 12.34);
+            CHECK(json::parse("-1.25e3").get<double>() == -1250.0);
+            CHECK(json::parse("1.0e1").get<double>() == 10.0);
+            CHECK(json::parse("0.1").get<double>() == 0.1);
+            CHECK(json::parse("0.30000000000000004").get<double>() == 0.30000000000000004);
+        }
+
+        SECTION("serialization")
+        {
+            CHECK(json::parse("12.34").dump() == "12.34");
+            CHECK(json(12.34).dump() == "12.34");
+            CHECK(json(-1250.0).dump() == "-1250.0");
+        }
+
+        SECTION("SAX parsing")
+        {
+            // the text of a floating-point number reaches the consumer verbatim
+            ParserImpl sax {};
+            json::sax_parse("12.34", &sax);
+            CHECK(sax.float_string_copy == "12.34");
+        }
+
+        SECTION("a floating-point type that is serialized with snprintf")
+        {
+            CHECK(json_long_double::parse("12.34").get<long double>() == 12.34L);
+            CHECK(json_long_double::parse("-1.25e3").get<long double>() == -1250.0L);
+
+            // only values that a long double holds exactly have a short representation
+            CHECK(json_long_double(0.5L).dump() == "0.5");
+            CHECK(json_long_double(12.5L).dump() == "12.5");
+            CHECK(json_long_double(-1250.0L).dump() == "-1250.0");
+            CHECK(json_long_double::parse("0.5").dump() == "0.5");
+        }
+
+        SECTION("JSON pointers with numeric reference tokens")
+        {
+            json array;
+            array["/0"_json_pointer] = 42;
+            CHECK(array.is_array());
+            CHECK(array[0] == 42);
+        }
+    }
+
+    std::setlocale(LC_NUMERIC, "C");
 }
